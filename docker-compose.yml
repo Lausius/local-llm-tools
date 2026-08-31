@@ -1,0 +1,45 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"   # optional: exposes Ollama to your host too, e.g. for `ollama run` from outside Docker
+    volumes:
+      - ollama_data:/root/.ollama   # persists downloaded models across container restarts/rebuilds
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  bot:
+    build: .
+    container_name: discord-mistral-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Inside Docker's network, containers reach each other by service name,
+      # not localhost -- this overrides whatever OLLAMA_URL is in .env.
+      - OLLAMA_URL=http://ollama:11434/api/generate
+    volumes:
+      # Persists chat_memory.json, remembered_facts.json, schedules.json
+      # across container restarts/rebuilds. Mounted at /app/data (NOT /app)
+      # so it doesn't hide the application code copied into the image.
+      - bot_data:/app/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+volumes:
+  ollama_data:
+  bot_data:
