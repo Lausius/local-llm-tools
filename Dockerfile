@@ -9,8 +9,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY discord_mistral_bot.py schedule_manager.py stock_digest.py ./
+# Copy application code and reference docs -- code_search.py's !code command
+# searches these files at runtime, so they need to physically exist here.
+COPY discord_mistral_bot.py schedule_manager.py stock_digest.py code_search.py ./
+COPY SELF_KNOWLEDGE.md README.md docker-compose.yml ./
 
 # Data files (chat_memory.json, remembered_facts.json, schedules.json) live
 # in a separate directory from the code, so a volume mounted here doesn't

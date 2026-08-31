@@ -25,6 +25,14 @@ Commands (type these as a message in the channel):
                         Only 4 fixed, validated actions exist (see
                         schedule_manager.py) -- the model can never run
                         arbitrary commands, only request one of these.
+    !code <question>    Ask about the bot's own implementation. Uses
+                        keyword search over the actual source files
+                        (code_search.py) so answers are grounded in real
+                        code, not guessed.
+
+A short self-description (SELF_KNOWLEDGE.md) is injected into every prompt
+so the model gives accurate answers about what it is/can do, rather than
+inventing capabilities it doesn't have.
 
 Scheduling now runs in-process via APScheduler (schedule_manager.py), with
 state saved to schedules.json -- no host crontab needed, so this works
@@ -55,6 +63,7 @@ from dotenv import load_dotenv
 
 import schedule_manager as sched
 import stock_digest
+import code_search
 
 load_dotenv()
 
@@ -62,6 +71,22 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 MAX_DISCORD_LEN = 2000  # Discord's message length limit
+
+# Self-knowledge: a short, accurate description of what this bot is and can
+# do, loaded once and injected into every prompt (alongside remembered facts)
+# so the model answers questions about ITSELF from real documentation rather
+# than guessing. See SELF_KNOWLEDGE.md.
+SELF_KNOWLEDGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SELF_KNOWLEDGE.md")
+
+
+def load_self_knowledge() -> str:
+    if not os.path.exists(SELF_KNOWLEDGE_FILE):
+        return ""
+    with open(SELF_KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+SELF_KNOWLEDGE = load_self_knowledge()
 
 # Persistent memory: one JSON file, in a data directory that's kept separate
 # from the code directory. Locally this defaults to the script's own folder;
@@ -198,9 +223,12 @@ def ask_mistral(channel_id: int, user_message: str) -> str:
     if remembered_facts:
         facts_block = "Known facts about the user:\n" + "\n".join(f"- {f}" for f in remembered_facts) + "\n\n"
 
+    self_block = f"{SELF_KNOWLEDGE}\n\n" if SELF_KNOWLEDGE else ""
+
     system_note = (
         "You are a helpful assistant chatting in a Discord channel. "
         "Keep responses reasonably concise and conversational.\n\n"
+        + self_block
         + facts_block
     )
 
@@ -428,6 +456,43 @@ async def on_message(message: discord.Message):
     if user_text.lower().startswith("!schedule"):
         instruction = user_text[len("!schedule"):].strip()
         await handle_schedule_command(message.channel, instruction)
+        return
+
+    # Answer questions about the bot's own implementation, grounded in the
+    # actual source files (simple keyword search, no code execution involved).
+    if user_text.lower().startswith("!code"):
+        question = user_text[len("!code"):].strip()
+        if not question:
+            await message.channel.send("Usage: `!code <question>`, e.g. `!code how does fact extraction work`")
+            return
+        async with message.channel.typing():
+            try:
+                matches = code_search.search_codebase(question)
+                context = code_search.format_snippets_for_prompt(matches)
+                prompt = f"""You are answering a question about your own source code, using ONLY
+the code snippets below as ground truth. If the snippets don't actually
+answer the question, say so honestly rather than guessing.
+
+{context}
+
+Question: {question}
+
+Answer concisely, referencing the relevant file(s) by name."""
+                response = requests.post(
+                    OLLAMA_URL,
+                    json={"model": MODEL, "prompt": prompt, "stream": False},
+                    timeout=120,
+                )
+                response.raise_for_status()
+                answer = response.json()["response"].strip()
+            except requests.exceptions.ConnectionError:
+                await message.channel.send("Couldn't reach Ollama on this machine. Is it running?")
+                return
+            except Exception as e:
+                await message.channel.send(f"Error answering that: {e}")
+                return
+        for chunk in split_for_discord(answer):
+            await message.channel.send(chunk)
         return
 
     async with message.channel.typing():
