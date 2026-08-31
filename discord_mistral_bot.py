@@ -29,6 +29,8 @@ Commands (type these as a message in the channel):
                         keyword search over the actual source files
                         (code_search.py) so answers are grounded in real
                         code, not guessed.
+    !time               Show the container's current date/time/timezone --
+                        the ground truth used for all !schedule timing.
 
 A short self-description (SELF_KNOWLEDGE.md) is injected into every prompt
 so the model gives accurate answers about what it is/can do, rather than
@@ -59,6 +61,7 @@ import json
 import asyncio
 import requests
 import discord
+from datetime import datetime
 from dotenv import load_dotenv
 
 import schedule_manager as sched
@@ -225,10 +228,22 @@ def ask_mistral(channel_id: int, user_message: str) -> str:
 
     self_block = f"{SELF_KNOWLEDGE}\n\n" if SELF_KNOWLEDGE else ""
 
+    now_aware = datetime.now().astimezone()
+    time_block = (
+        f"Current date/time (REAL, accurate -- state it directly and "
+        f"confidently if asked, do not caveat or call it a guess): "
+        f"{now_aware.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')}\n\n"
+    )
+
     system_note = (
         "You are a helpful assistant chatting in a Discord channel. "
-        "Keep responses reasonably concise and conversational.\n\n"
+        "Keep replies SHORT -- 1 to 3 sentences for most messages. Only "
+        "write more than that if the user explicitly asks for detail, a "
+        "list, or an explanation. For casual messages and small talk, just "
+        "chat naturally -- don't list your commands or features unless the "
+        "user specifically asks what you can do.\n\n"
         + self_block
+        + time_block
         + facts_block
     )
 
@@ -448,6 +463,19 @@ async def on_message(message: discord.Message):
         remembered_facts.clear()
         save_facts(remembered_facts)
         await message.channel.send("All long-term facts cleared.")
+        return
+
+    # Show the container's own current date/time/timezone -- the ground
+    # truth used for all !schedule timing, so you can verify it matches
+    # your actual local time rather than assuming.
+    if user_text.lower() == "!time":
+        now_aware = datetime.now().astimezone()  # attaches the system's local tzinfo
+        tz_env = os.getenv("TZ", "not set (likely UTC)")
+        await message.channel.send(
+            f"Container time: **{now_aware.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')}**\n"
+            f"TZ environment variable: `{tz_env}`\n"
+            f"(This is the time scheduled digests are based on -- compare it to your actual local time.)"
+        )
         return
 
     # Schedule management -- explicit prefix only, never triggered by normal chat.

@@ -1,16 +1,20 @@
+
+· GITIGNORE
 # Secrets -- never commit these
 .env
-
+ 
 # Generated runtime data -- personal/conversation state, not source code
 chat_memory.json
 remembered_facts.json
 schedules.json
 digest_log.txt
 ollama.log
-
+data/
+ 
 # Python
 __pycache__/
 *.pyc
-
+ 
 # Docker
 .docker/
+ 

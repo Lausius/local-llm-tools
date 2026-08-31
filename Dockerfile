@@ -4,6 +4,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# tzdata is needed for the TZ environment variable (set in docker-compose.yml)
+# to actually resolve to a real timezone -- the slim base image doesn't
+# include it by default.
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (better layer caching -- only reinstalls if
 # requirements.txt changes, not on every code edit)
 COPY requirements.txt .

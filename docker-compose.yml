@@ -31,15 +31,18 @@ services:
       # Inside Docker's network, containers reach each other by service name,
       # not localhost -- this overrides whatever OLLAMA_URL is in .env.
       - OLLAMA_URL=http://ollama:11434/api/generate
+      # Containers default to UTC regardless of host timezone. Without this,
+      # scheduled times (e.g. !schedule add ... at 08:00) would be
+      # interpreted in UTC, not your local time.
+      - TZ=Europe/Copenhagen
     volumes:
-      # Persists chat_memory.json, remembered_facts.json, schedules.json
-      # across container restarts/rebuilds. Mounted at /app/data (NOT /app)
-      # so it doesn't hide the application code copied into the image.
-      - bot_data:/app/data
+      # Bind mount (not a named volume) so the data files are visible and
+      # editable directly on your filesystem, in ./data next to this compose
+      # file -- not hidden inside Docker's internal volume storage.
+      - ./data:/app/data
     depends_on:
       ollama:
         condition: service_healthy
 
 volumes:
   ollama_data:
-  bot_data:
