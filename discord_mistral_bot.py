@@ -283,6 +283,18 @@ def should_inject_self_knowledge(user_message: str) -> bool:
         "how do i use",
         "what is your purpose",
         "can you explain yourself",
+        "what model are you using",
+        "what llm are you using",
+        "which model are you using",
+        "what model are you",
+        "you are the discord bot",
+        "you are the bot",
+        "you are my coding project",
+        "do you have any memory",
+        "do you have memory",
+        "how can i check your memory",
+        "how do i check your memory",
+        "do you remember",
         "!schedule",
         "!facts",
         "!forget",
@@ -382,6 +394,171 @@ def split_for_discord(text: str, limit: int = MAX_DISCORD_LEN):
         text = text[split_at:]
     chunks.append(text)
     return chunks
+
+
+def answer_code_question(question: str) -> str | None:
+    """Provide crisp, implementation-grounded answers for common code questions
+    without relying on the model to improvise a vague description.
+    """
+    q = question.lower().strip()
+
+    if "remember" in q or "memory" in q:
+        return (
+            "Memory works in two layers: `load_memory()`/`save_memory()` in `discord_mistral_bot.py` keep the rolling channel history, and `extract_fact()` plus `remember_fact_if_any()` decide whether a message contains a durable fact worth keeping. New facts are saved to `remembered_facts.json`, and the bot injects them back into future prompts."
+        )
+
+    if "fact" in q and ("store" in q or "saved" in q or "remember" in q or "memory" in q):
+        return (
+            "Long-term facts are stored in `remembered_facts.json` via `save_facts()`. The fact extraction path is `extract_fact()` -> `remember_fact_if_any()` -> `save_facts()`, and the bot reloads those facts into each prompt via `load_facts()` before generating a reply."
+        )
+
+    if "fact" in q and ("extract" in q or "remember" in q):
+        return (
+            "Fact extraction lives in `extract_fact()` in `discord_mistral_bot.py`: it sends the user message to the local Ollama model with a strict prompt that asks whether the message contains a durable fact. If the answer is a real fact, it returns a short string; otherwise it returns `None`. `remember_fact_if_any()` then stores it only if it is new, and `save_facts()` writes it to `remembered_facts.json`."
+        )
+
+    if "schedule" in q:
+        return (
+            "Scheduling is handled by `schedule_manager.py`. It validates ticker names and times, saves jobs to `schedules.json`, and uses APScheduler to fire a digest at the configured HH:MM time. `discord_mistral_bot.py` calls `handle_schedule_command()` for `!schedule list/add/remove/edit`, and the scheduled job eventually calls `stock_digest.run_digest()`."
+        )
+
+    if "search" in q and "code" in q:
+        return (
+            "The code search is in `code_search.py`. It tokenizes the query and source files, normalizes common terms (`remember`, `extract`, `schedule`), and ranks matches by overlap and by Python function definitions. `format_snippets_for_prompt()` then packages the best snippets for the model to answer the question."
+        )
+
+    return None
+
+
+FEATURE_HELP = {
+    "schedule": {
+        "keywords": ["schedule", "scheduled digest", "stock digest"],
+        "title": "Schedule commands",
+        "entries": [
+            ("!schedule add <ticker> at HH:MM", "Create a new schedule"),
+            ("!schedule list", "List all schedules"),
+            ("!schedule edit <id> to TSLA MSFT", "Edit an existing schedule"),
+            ("!schedule remove <id>", "Remove a schedule"),
+        ],
+    },
+    "facts": {
+        "keywords": ["facts", "remembered facts", "forget-fact", "forget facts", "memory", "remember"],
+        "title": "Memory commands",
+        "entries": [
+            ("!facts", "Show remembered facts"),
+            ("!forget-fact <number>", "Delete one fact"),
+            ("!forget-facts", "Clear all facts"),
+        ],
+    },
+    "code": {
+        "keywords": ["!code", "code question", "how does code", "how do you remember", "code extraction"],
+        "title": "Code-inspection commands",
+        "entries": [
+            ("!code <question>", "Ask about the bot's own implementation"),
+        ],
+    },
+}
+
+
+def get_feature_help_message(user_text: str) -> str | None:
+    """Return a formatted help message for a requested feature, using a small
+    registry instead of a fragile chain of one-off string matches.
+    """
+    lower = user_text.lower()
+    if not lower.startswith("!") and is_self_reference_question(lower):
+        return None
+
+    help_verbs = ["how", "show", "what", "create", "make", "add", "remove", "delete", "edit", "list", "use"]
+    matched = []
+
+    for feature_key, config in FEATURE_HELP.items():
+        if any(keyword in lower for keyword in config["keywords"]) and any(verb in lower for verb in help_verbs):
+            matched.append((feature_key, config))
+
+    if not matched:
+        return None
+
+    feature_key, config = matched[0]
+    lines = [f"{config['title']}:"]
+    for command, description in config["entries"]:
+        lines.append(f"- `{command}` — {description}")
+    return "\n".join(lines)
+
+
+def is_self_reference_question(text: str) -> bool:
+    """Generic classifiers for identity/model/memory questions: they should
+    answer from self-knowledge + repo context rather than bespoke static text.
+    """
+    lower = text.lower()
+    patterns = [
+        "what model",
+        "which model",
+        "what llm",
+        "what are you",
+        "who are you",
+        "what can you do",
+        "what should i call you",
+        "what is your name",
+        "do you remember",
+        "do you have memory",
+        "how do you remember",
+        "what stores long-term facts",
+        "what stores long term facts",
+        "what stores facts",
+        "where are long-term facts",
+        "where are facts stored",
+        "how does fact extraction work",
+        "how does scheduling work",
+        "you are the bot",
+        "you are the discord bot",
+        "your coding project",
+        "this bot",
+        "what is your purpose",
+        "how do you work",
+    ]
+    return any(p in lower for p in patterns)
+
+
+async def answer_self_reference_question(channel, user_text: str):
+    """Generic self-identity answer: ask the model using self-knowledge and repo context,
+    rather than a growing pile of hardcoded response branches.
+    """
+    question = user_text.strip()
+    try:
+        matches = code_search.search_codebase(question)
+        context = code_search.format_snippets_for_prompt(matches)
+    except Exception:
+        context = "No source context available."
+
+    prompt = f"""Answer this question as the bot itself, using the project self-knowledge and the code snippets below as source ground truth.
+Keep the reply brief and direct, and do not mention generic AI disclaimers or generic help text.
+
+SELF KNOWLEDGE:
+{SELF_KNOWLEDGE}
+
+SOURCE CONTEXT:
+{context}
+
+Question: {question}
+
+Answer:"""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": MODEL, "prompt": prompt, "stream": False},
+            timeout=120,
+        )
+        response.raise_for_status()
+        answer = response.json()["response"].strip()
+    except Exception:
+        answer = (
+            "I am the Discord bot for this project, running locally via Ollama with Mistral. "
+            "I can remember facts, answer questions about the project, and help manage stock schedules."
+        )
+
+    answer = apply_user_preferences(answer, question)
+    for chunk in split_for_discord(answer):
+        await channel.send(chunk)
 
 
 def apply_user_preferences(reply: str, user_message: str | None = None) -> str:
@@ -634,13 +811,9 @@ async def on_message(message: discord.Message):
             await message.channel.send(f"You can call me {default_name}.")
         return
 
-    if "what can you do" in lower_text:
-        await message.channel.send(
-            "I can chat naturally, remember facts from our conversations, and help with stock-digest scheduling if you ask. I can also answer questions about the bot itself with `!code`."
-        )
-        return
-
-    # Simple command to wipe this channel's rolling chat history
+    # Commands must always take precedence over generic self-reference helpers.
+    # This prevents natural-language queries like "!code how do you remember?"
+    # from being mistaken for a general identity question or help message.
     if lower_text == "!forget":
         channel_key = str(message.channel.id)
         channel_history.pop(channel_key, None)
@@ -648,7 +821,6 @@ async def on_message(message: discord.Message):
         await message.channel.send("Chat history cleared for this channel.")
         return
 
-    # Show what long-term facts are currently remembered
     if lower_text == "!facts":
         if not remembered_facts:
             await message.channel.send("I don't have any long-term facts stored yet.")
@@ -661,7 +833,6 @@ async def on_message(message: discord.Message):
                 await message.channel.send(chunk)
         return
 
-    # Remove a single fact by its number (as shown in !facts)
     if user_text.lower().startswith("!forget-fact "):
         try:
             index = int(user_text.split(maxsplit=1)[1]) - 1
@@ -672,18 +843,14 @@ async def on_message(message: discord.Message):
             await message.channel.send("Usage: `!forget-fact <number>` -- check `!facts` for valid numbers.")
         return
 
-    # Wipe all long-term facts
     if user_text.lower() == "!forget-facts":
         remembered_facts.clear()
         save_facts(remembered_facts)
         await message.channel.send("All long-term facts cleared.")
         return
 
-    # Show the container's own current date/time/timezone -- the ground
-    # truth used for all !schedule timing, so you can verify it matches
-    # your actual local time rather than assuming.
     if user_text.lower() == "!time":
-        now_aware = datetime.now().astimezone()  # attaches the system's local tzinfo
+        now_aware = datetime.now().astimezone()
         tz_env = os.getenv("TZ", "not set (likely UTC)")
         await message.channel.send(
             f"Container time: **{now_aware.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')}**\n"
@@ -692,34 +859,37 @@ async def on_message(message: discord.Message):
         )
         return
 
-    # Schedule management -- explicit prefix only, never triggered by normal chat.
-    # The model is only ever allowed to choose one of a fixed set of validated
-    # actions (see schedule_manager.py) -- it never gets shell or file access.
     if user_text.lower().startswith("!schedule"):
         instruction = user_text[len("!schedule"):].strip()
         await handle_schedule_command(message.channel, instruction)
         return
 
-    # Answer questions about the bot's own implementation, grounded in the
-    # actual source files (simple keyword search, no code execution involved).
     if user_text.lower().startswith("!code"):
         question = user_text[len("!code"):].strip()
         if not question:
             await message.channel.send("Usage: `!code <question>`, e.g. `!code how does fact extraction work`")
             return
+
+        direct_answer = answer_code_question(question)
+        if direct_answer:
+            for chunk in split_for_discord(direct_answer):
+                await message.channel.send(chunk)
+            return
+
         async with message.channel.typing():
             try:
                 matches = code_search.search_codebase(question)
                 context = code_search.format_snippets_for_prompt(matches)
                 prompt = f"""You are answering a question about your own source code, using ONLY
-the code snippets below as ground truth. If the snippets don't actually
-answer the question, say so honestly rather than guessing.
+the code snippets below as ground truth. Explain the actual behavior in a
+short, direct answer, no rambling. Keep it to 2 short paragraphs or a few
+bullet points. Mention the relevant file(s) by name.
 
 {context}
 
 Question: {question}
 
-Answer concisely, referencing the relevant file(s) by name."""
+Answer:"""
                 response = requests.post(
                     OLLAMA_URL,
                     json={"model": MODEL, "prompt": prompt, "stream": False},
@@ -735,6 +905,15 @@ Answer concisely, referencing the relevant file(s) by name."""
                 return
         for chunk in split_for_discord(answer):
             await message.channel.send(chunk)
+        return
+
+    if is_self_reference_question(lower_text):
+        await answer_self_reference_question(message.channel, user_text)
+        return
+
+    feature_help = get_feature_help_message(user_text)
+    if feature_help:
+        await message.channel.send(feature_help)
         return
 
     async with message.channel.typing():

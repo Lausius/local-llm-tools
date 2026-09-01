@@ -10,8 +10,9 @@ A self-hosted Discord bot backed by a local LLM (Mistral, via [Ollama](https://o
 - **Two layers of memory:**
   - *Rolling chat history* (`chat_memory.json`) — short-term context per channel.
   - *Long-term facts* (`remembered_facts.json`) — durable facts extracted from conversation (preferences, dates, ongoing projects), remembered across restarts and channels.
-- **Live stock digests** — fetches real market data (via `yfinance`) and has Mistral summarize it in plain English, posted to Discord via webhook. Avoids the model ever inventing prices or facts — real data goes in, a summary comes out.
+- **Live stock digests** — fetches real market data from Alpha Vantage and has Mistral summarize it in plain English, posted to Discord via webhook. Avoids the model ever inventing prices or facts — real data goes in, a summary comes out.
 - **Safe, scheduled digests** — `!schedule` lets you manage recurring digests in plain English. The model can only ever trigger one of four fixed, validated actions (list/add/remove/edit) — it never gets shell or file access. See [Safety design](#safety-design) below.
+- **Code introspection** — `!code <question>` answers questions about the bot’s own implementation using a local keyword search over the project source, so answers are grounded in the actual code rather than guesswork.
 - **Fully containerized** — Ollama + the bot run in Docker with GPU passthrough, making the whole setup portable across machines/distros.
 
 ---
@@ -101,7 +102,15 @@ In the channel you want digests posted to: **Edit Channel → Integrations → W
 ```bash
 cp .env.example .env
 ```
-Edit `.env` and fill in `DISCORD_BOT_TOKEN` and `STOCK_WEBHOOK_URL`.
+Edit `.env` and fill in at least:
+- `DISCORD_BOT_TOKEN`
+- `STOCK_WEBHOOK_URL`
+- `ALPHA_VANTAGE_API_KEY` (for live stock digests)
+
+Optional:
+- `OLLAMA_URL` (defaults to `http://localhost:11434/api/generate` or Docker service URL in compose)
+- `OLLAMA_EMBED_MODEL` (defaults to `nomic-embed-text`; used for local repo indexing for `!code` semantic retrieval)
+- `DATA_DIR` (if you want bot data stored outside the repo folder)
 
 ### 6. Build and start everything
 
@@ -109,10 +118,17 @@ Edit `.env` and fill in `DISCORD_BOT_TOKEN` and `STOCK_WEBHOOK_URL`.
 docker compose up -d
 ```
 
-### 7. Pull the model into the containerized Ollama
+### 7. Start Ollama and pull the required models
+
+```bash
+docker compose up -d
+```
+
+Once the `ollama` container is healthy, pull the models you need:
 
 ```bash
 docker exec -it ollama ollama pull mistral
+docker exec -it ollama ollama pull nomic-embed-text
 ```
 
 ### 8. Verify
@@ -143,6 +159,7 @@ Just type any message in the channel the bot is in — it replies using Mistral,
 | `!schedule add AAPL ORSTED.CO at 08:00` | Add a new daily digest schedule |
 | `!schedule edit <id> to TSLA MSFT` | Change an existing schedule's tickers |
 | `!schedule remove <id>` | Remove a schedule |
+| `!code <question>` | Ask the bot to explain how the project works, using repo search and source-grounded answers |
 
 ### Manual stock digest (without scheduling)
 ```bash
