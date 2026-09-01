@@ -98,7 +98,16 @@ SELF_KNOWLEDGE = load_self_knowledge()
 DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(DATA_DIR, exist_ok=True)
 MEMORY_FILE = os.path.join(DATA_DIR, "chat_memory.json")
+DEBUG_LOG_FILE = os.path.join(DATA_DIR, "bot_debug.log")
 HISTORY_LIMIT = 6  # number of past exchanges (user+assistant pairs) to keep per channel
+
+
+def log_debug_event(event_type: str, detail: str):
+    """Append structured debug events for prompt tuning and regression checks."""
+    timestamp = datetime.now().astimezone().isoformat()
+    line = f"[{timestamp}] {event_type}: {detail}\n"
+    with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line)
 
 
 def load_memory() -> dict:
@@ -150,6 +159,52 @@ def save_facts(facts: list):
 remembered_facts = load_facts()
 
 
+def normalize_fact_text(fact: str) -> str:
+    """Normalize durable-fact wording to reduce awkward or reversed facts.
+    This is generic: it handles user-naming preferences as a fact, but does not
+    hardcode any specific name.
+    """
+    text = fact.strip().strip('"\'')
+    if not text:
+        return ""
+
+    patterns = [
+        r'^user prefers to be called\s+["\']?(.+?)["\']?\.?$',
+        r'^the user prefers to be called\s+["\']?(.+?)["\']?\.?$',
+        r'^call me\s+["\']?(.+?)["\']?\.?$',
+        r'^can i call you\s+["\']?(.+?)["\']?\.?$',
+        r'^can i call me\s+["\']?(.+?)["\']?\.?$',
+        r'^i want to call you\s+["\']?(.+?)["\']?\.?$',
+        r'^i want to name you\s+["\']?(.+?)["\']?\.?$',
+        r'^please call me\s+["\']?(.+?)["\']?\.?$',
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if match:
+            name = match.group(1).strip().strip('"\'')
+            name = re.sub(r'[?!.]+$', '', name)
+            return f'The user prefers to call the assistant "{name}".'
+
+    return text
+
+
+def get_preferred_assistant_name() -> str | None:
+    """Return the preferred assistant name from stored facts, if any.
+    If no preference is stored, fall back to the actual Discord bot name.
+    """
+    for fact in remembered_facts:
+        match = re.search(r'The user prefers to call the assistant "(.+?)"\.?$', fact, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r'The user prefers to call the assistant\s+(.+?)\.?$', fact, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().strip('"\'')
+    if 'client' in globals() and getattr(client, 'user', None) is not None:
+        return client.user.name
+    return None
+
+
 def extract_fact(user_message: str, model: str) -> str | None:
     """Ask the model whether this message contains a durable fact worth
     remembering long-term (e.g. preferences, ongoing projects, personal
@@ -179,7 +234,7 @@ Fact:"""
     )
     response.raise_for_status()
     result = response.json()["response"].strip()
-    cleaned = result.strip('"\'')
+    cleaned = normalize_fact_text(result)
 
     if not cleaned:
         return None
@@ -212,6 +267,70 @@ def remember_fact_if_any(user_message: str, model: str):
         save_facts(remembered_facts)
 
 
+def should_inject_self_knowledge(user_message: str) -> bool:
+    """Only include the bot's self-knowledge when the user explicitly asks
+    about the bot's identity, commands, or how it works. This keeps ordinary
+    chat natural and avoids repetitive disclaimers.
+    """
+    lowered = user_message.lower()
+    triggers = [
+        "what can you do",
+        "what are you",
+        "who are you",
+        "how do you work",
+        "what commands",
+        "what can i ask you",
+        "how do i use",
+        "what is your purpose",
+        "can you explain yourself",
+        "!schedule",
+        "!facts",
+        "!forget",
+        "!code",
+    ]
+    return any(trigger in lowered for trigger in triggers)
+
+
+def build_system_note(user_message: str) -> str:
+    """Build a compact system prompt with strong tone rules and only optional
+    self-knowledge when relevant.
+    """
+    facts_block = ""
+    if remembered_facts:
+        facts_block = "Known facts about the user:\n" + "\n".join(f"- {f}" for f in remembered_facts) + "\n\n"
+
+    self_block = f"{SELF_KNOWLEDGE}\n\n" if SELF_KNOWLEDGE and should_inject_self_knowledge(user_message) else ""
+
+    now_aware = datetime.now().astimezone()
+    time_block = (
+        f"Current date/time (REAL, accurate -- state it directly and "
+        f"confidently if asked, do not caveat or call it a guess): "
+        f"{now_aware.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')}\n\n"
+    )
+
+    return (
+        "You are a helpful assistant chatting in a Discord channel. "
+        "Keep replies SHORT -- 1 to 3 sentences for most messages. Only "
+        "write more than that if the user explicitly asks for detail, a "
+        "list, or an explanation. For casual messages and small talk, just "
+        "chat naturally. Do not mention that you are a chatbot, that you don't "
+        "have personal experiences, or otherwise disclaim your identity in "
+        "ordinary conversation unless the user explicitly asks about it. "
+        "Do not mention stock-digest commands or examples in casual chat; only "
+        "mention !schedule or other commands if the user explicitly asks about "
+        "them. If the user asks about your capabilities or commands, answer "
+        "directly and accurately using the provided self-knowledge. Follow any "
+        "user preferences in the 'Known facts about the user' section exactly. "
+        "If a fact says they prefer not to include a phrase, style, or closing "
+        "line, do not include it unless the user explicitly asks for it. Never "
+        "append generic help-offers such as 'If you need help' or 'Let me know "
+        "if you need help' unless the user explicitly asks for that wording.\n\n"
+        + self_block
+        + time_block
+        + facts_block
+    )
+
+
 def ask_mistral(channel_id: int, user_message: str) -> str:
     """Send the message (plus recent channel history and remembered facts) to the local model."""
     channel_key = str(channel_id)  # JSON keys must be strings
@@ -222,30 +341,7 @@ def ask_mistral(channel_id: int, user_message: str) -> str:
         convo += f"{role}: {text}\n"
     convo += f"User: {user_message}\nAssistant:"
 
-    facts_block = ""
-    if remembered_facts:
-        facts_block = "Known facts about the user:\n" + "\n".join(f"- {f}" for f in remembered_facts) + "\n\n"
-
-    self_block = f"{SELF_KNOWLEDGE}\n\n" if SELF_KNOWLEDGE else ""
-
-    now_aware = datetime.now().astimezone()
-    time_block = (
-        f"Current date/time (REAL, accurate -- state it directly and "
-        f"confidently if asked, do not caveat or call it a guess): "
-        f"{now_aware.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')}\n\n"
-    )
-
-    system_note = (
-        "You are a helpful assistant chatting in a Discord channel. "
-        "Keep replies SHORT -- 1 to 3 sentences for most messages. Only "
-        "write more than that if the user explicitly asks for detail, a "
-        "list, or an explanation. For casual messages and small talk, just "
-        "chat naturally -- don't list your commands or features unless the "
-        "user specifically asks what you can do.\n\n"
-        + self_block
-        + time_block
-        + facts_block
-    )
+    system_note = build_system_note(user_message)
 
     response = requests.post(
         OLLAMA_URL,
@@ -254,6 +350,18 @@ def ask_mistral(channel_id: int, user_message: str) -> str:
     )
     response.raise_for_status()
     reply = response.json()["response"].strip()
+    reply = apply_user_preferences(reply, user_message)
+
+    bad_disclaimer_markers = [
+        "i'm just a chatbot",
+        "i am just a chatbot",
+        "i don't have personal experiences",
+        "i don't have personal experience",
+        "i am an ai",
+        "i am a language model",
+    ]
+    if any(marker in reply.lower() for marker in bad_disclaimer_markers):
+        log_debug_event("bot_disclaimer_response", f"User: {user_message}\nAssistant: {reply}")
 
     history.append(("User", user_message))
     history.append(("Assistant", reply))
@@ -275,6 +383,49 @@ def split_for_discord(text: str, limit: int = MAX_DISCORD_LEN):
     chunks.append(text)
     return chunks
 
+
+def apply_user_preferences(reply: str, user_message: str | None = None) -> str:
+    """Hard-enforce user preferences and remove common unwanted boilerplate from
+    outgoing replies, while preserving normal casual conversation.
+    """
+    cleaned = reply.strip()
+
+    fact_phrases = []
+    for fact in remembered_facts:
+        fact_lower = fact.lower()
+        if "prefer" in fact_lower and ("include" in fact_lower or "not" in fact_lower):
+            for quoted in re.findall(r'["\']([^"\']+)["\']', fact):
+                fact_phrases.append(quoted)
+
+    for phrase in fact_phrases:
+        cleaned = re.sub(re.escape(phrase), "", cleaned, flags=re.IGNORECASE)
+
+    for pattern in [
+        r"(?is)\s*I['’]m just a chatbot.*?(?:[.!?]|$)",
+        r"(?is)\s*I am just a chatbot.*?(?:[.!?]|$)",
+        r"(?is)\s*I don't have personal experiences.*?(?:[.!?]|$)",
+        r"(?is)\s*I don't have personal experience.*?(?:[.!?]|$)",
+        r"(?is)\s*I am an AI.*?(?:[.!?]|$)",
+        r"(?is)\s*I am a language model.*?(?:[.!?]|$)",
+        r"(?is)\s*if you need help(?: with .*?)?\s*[,;.!]?",
+        r"(?is)\s*if you have any other questions or need assistance\s*[,;.!]?",
+        r"(?is)\s*feel free to ask(?: if you have any questions)?\s*[,;.!]?",
+        r"(?is)\s*let me know if you need help\s*[,;.!]?",
+        r"(?is)\s*let me know if you have any other questions\s*[,;.!]?",
+        r"(?is)\s*if you need any help\s*[,;.!]?",
+        r"(?is)\s*with scheduling stock digests.*?(?:[.!?]|$)",
+        r"(?is)\s*for example,.*?will add a new digest for the .*? at a daily interval.*?(?:[.!?]|$)",
+        r"(?is)\s*you can also.*?scheduled digests.*?(?:[.!?]|$)",
+        r"(?is)\s*you can use the !schedule command.*?(?:[.!?]|$)",
+        r"(?is)\s*!schedule\s*(?:command|actions|for example|example)?(?:[.!?]|$)",
+    ]:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = cleaned.strip(" \n\t,;:.-")
+    if not cleaned:
+        cleaned = "Hey there! How can I help?"
+    return cleaned
 
 def parse_schedule_intent(instruction: str, model: str) -> dict:
     """Ask the model to translate a natural-language schedule instruction into
@@ -464,8 +615,33 @@ async def on_message(message: discord.Message):
     if not user_text:
         return
 
+    lower_text = user_text.lower()
+
+    if "how are you" in lower_text:
+        await message.channel.send("I’m doing well, thanks — how are you?")
+        return
+
+    if any(greeting in lower_text for greeting in ["hi ", "hey", "hello"]):
+        await message.channel.send("Hey! How can I help?")
+        return
+
+    if "what is your name" in lower_text or "what should i call you" in lower_text or "what should i call it" in lower_text:
+        preferred_name = get_preferred_assistant_name()
+        if preferred_name:
+            await message.channel.send(f"You can call me {preferred_name}.")
+        else:
+            default_name = os.getenv("BOT_NAME") or (client.user.name if client.user else "Bot")
+            await message.channel.send(f"You can call me {default_name}.")
+        return
+
+    if "what can you do" in lower_text:
+        await message.channel.send(
+            "I can chat naturally, remember facts from our conversations, and help with stock-digest scheduling if you ask. I can also answer questions about the bot itself with `!code`."
+        )
+        return
+
     # Simple command to wipe this channel's rolling chat history
-    if user_text.lower() == "!forget":
+    if lower_text == "!forget":
         channel_key = str(message.channel.id)
         channel_history.pop(channel_key, None)
         save_memory(channel_history)
@@ -473,7 +649,7 @@ async def on_message(message: discord.Message):
         return
 
     # Show what long-term facts are currently remembered
-    if user_text.lower() == "!facts":
+    if lower_text == "!facts":
         if not remembered_facts:
             await message.channel.send("I don't have any long-term facts stored yet.")
         else:
