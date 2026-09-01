@@ -4,7 +4,7 @@ services:
     container_name: ollama
     restart: unless-stopped
     ports:
-      - "11434:11434"   # optional: exposes Ollama to your host too, e.g. for `ollama run` from outside Docker
+      - "127.0.0.1:11434:11434"   # host access without exposing Ollama to the LAN
     volumes:
       - ollama_data:/root/.ollama   # persists downloaded models across container restarts/rebuilds
     deploy:
