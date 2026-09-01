@@ -25,6 +25,9 @@ Commands (type these as a message in the channel):
                         Only 4 fixed, validated actions exist (see
                         schedule_manager.py) -- the model can never run
                         arbitrary commands, only request one of these.
+                        Add/edit/remove must then be approved with !confirm.
+    !confirm            Confirm a pending schedule change (expires after 60s).
+    !cancel             Cancel a pending schedule change.
     !code <question>    Ask about the bot's own implementation. Uses
                         keyword search over the actual source files
                         (code_search.py) so answers are grounded in real
@@ -59,6 +62,7 @@ import os
 import re
 import json
 import asyncio
+import time
 import requests
 import discord
 from datetime import datetime
@@ -74,6 +78,23 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 MAX_DISCORD_LEN = 2000  # Discord's message length limit
+
+
+def _parse_id_allowlist(name: str) -> set[int]:
+    """Parse a comma-separated Discord ID allowlist from the environment."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return set()
+    try:
+        return {int(value.strip()) for value in raw.split(",") if value.strip()}
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must contain only comma-separated numeric Discord IDs") from exc
+
+
+ALLOWED_USER_IDS = _parse_id_allowlist("ALLOWED_USER_IDS")
+ALLOWED_CHANNEL_IDS = _parse_id_allowlist("ALLOWED_CHANNEL_IDS")
+CONFIRMATION_TTL_SECONDS = int(os.getenv("CONFIRMATION_TTL_SECONDS", "60"))
+pending_schedule_actions: dict[tuple[int, int], dict] = {}
 
 # Self-knowledge: a short, accurate description of what this bot is and can
 # do, loaded once and injected into every prompt (alongside remembered facts)
@@ -136,6 +157,7 @@ channel_history = load_memory()  # loaded once at startup, kept in memory + writ
 # channel) since facts about you are true regardless of which channel you're in.
 FACTS_FILE = os.path.join(DATA_DIR, "remembered_facts.json")
 MAX_FACTS = 200  # simple cap so the file/prompt doesn't grow unbounded
+MAX_INJECTED_FACTS = int(os.getenv("MAX_INJECTED_FACTS", "20"))
 
 
 def load_facts() -> list:
@@ -205,7 +227,30 @@ def get_preferred_assistant_name() -> str | None:
     return None
 
 
-def extract_fact(user_message: str, model: str) -> str | None:
+def ollama_generate(
+    prompt: str,
+    model: str,
+    *,
+    timeout: int = 120,
+    temperature: float = 0.2,
+    response_format=None,
+) -> str:
+    """Synchronous Ollama helper. Call it through asyncio.to_thread in Discord handlers."""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": temperature},
+    }
+    if response_format is not None:
+        payload["format"] = response_format
+
+    response = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+    response.raise_for_status()
+    return response.json()["response"].strip()
+
+
+async def extract_fact(user_message: str, model: str) -> str | None:
     """Ask the model whether this message contains a durable fact worth
     remembering long-term (e.g. preferences, ongoing projects, personal
     details). Returns the fact as a short string, or None if there isn't one.
@@ -227,13 +272,13 @@ Message: "{user_message}"
 
 Fact:"""
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": model, "prompt": prompt, "stream": False},
+    result = await asyncio.to_thread(
+        ollama_generate,
+        prompt,
+        model,
         timeout=60,
+        temperature=0,
     )
-    response.raise_for_status()
-    result = response.json()["response"].strip()
     cleaned = normalize_fact_text(result)
 
     if not cleaned:
@@ -258,13 +303,16 @@ Fact:"""
     return cleaned
 
 
-def remember_fact_if_any(user_message: str, model: str):
+async def remember_fact_if_any(user_message: str, model: str):
     """Extract a fact from the message (if any) and store it, avoiding exact duplicates."""
-    fact = extract_fact(user_message, model)
-    if fact and fact not in remembered_facts:
-        remembered_facts.append(fact)
-        del remembered_facts[:-MAX_FACTS]  # keep only the most recent MAX_FACTS
-        save_facts(remembered_facts)
+    try:
+        fact = await extract_fact(user_message, model)
+        if fact and fact not in remembered_facts:
+            remembered_facts.append(fact)
+            del remembered_facts[:-MAX_FACTS]  # keep only the most recent MAX_FACTS
+            save_facts(remembered_facts)
+    except Exception as exc:
+        log_debug_event("fact_extraction_error", str(exc))
 
 
 def should_inject_self_knowledge(user_message: str) -> bool:
@@ -309,7 +357,8 @@ def build_system_note(user_message: str) -> str:
     """
     facts_block = ""
     if remembered_facts:
-        facts_block = "Known facts about the user:\n" + "\n".join(f"- {f}" for f in remembered_facts) + "\n\n"
+        selected_facts = remembered_facts[-MAX_INJECTED_FACTS:]
+        facts_block = "Known facts about the user:\n" + "\n".join(f"- {f}" for f in selected_facts) + "\n\n"
 
     self_block = f"{SELF_KNOWLEDGE}\n\n" if SELF_KNOWLEDGE and should_inject_self_knowledge(user_message) else ""
 
@@ -343,7 +392,7 @@ def build_system_note(user_message: str) -> str:
     )
 
 
-def ask_mistral(channel_id: int, user_message: str) -> str:
+async def ask_mistral(channel_id: int, user_message: str) -> str:
     """Send the message (plus recent channel history and remembered facts) to the local model."""
     channel_key = str(channel_id)  # JSON keys must be strings
     history = channel_history.get(channel_key, [])
@@ -355,13 +404,13 @@ def ask_mistral(channel_id: int, user_message: str) -> str:
 
     system_note = build_system_note(user_message)
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": MODEL, "prompt": system_note + convo, "stream": False},
+    reply = await asyncio.to_thread(
+        ollama_generate,
+        system_note + convo,
+        MODEL,
         timeout=120,
+        temperature=0.2,
     )
-    response.raise_for_status()
-    reply = response.json()["response"].strip()
     reply = apply_user_preferences(reply, user_message)
 
     bad_disclaimer_markers = [
@@ -525,7 +574,7 @@ async def answer_self_reference_question(channel, user_text: str):
     """
     question = user_text.strip()
     try:
-        matches = code_search.search_codebase(question)
+        matches = await asyncio.to_thread(code_search.search_codebase, question)
         context = code_search.format_snippets_for_prompt(matches)
     except Exception:
         context = "No source context available."
@@ -543,13 +592,13 @@ Question: {question}
 
 Answer:"""
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={"model": MODEL, "prompt": prompt, "stream": False},
+        answer = await asyncio.to_thread(
+            ollama_generate,
+            prompt,
+            MODEL,
             timeout=120,
+            temperature=0.2,
         )
-        response.raise_for_status()
-        answer = response.json()["response"].strip()
     except Exception:
         answer = (
             "I am the Discord bot for this project, running locally via Ollama with Mistral. "
@@ -604,7 +653,51 @@ def apply_user_preferences(reply: str, user_message: str | None = None) -> str:
         cleaned = "Hey there! How can I help?"
     return cleaned
 
-def parse_schedule_intent(instruction: str, model: str) -> dict:
+SCHEDULE_INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["list", "add", "remove", "edit", "unknown"]},
+        "tickers": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+        "time": {"type": "string"},
+        "id": {"type": "string"},
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
+
+
+def validate_schedule_intent(parsed: object) -> dict:
+    """Apply action-specific validation after Ollama's schema-constrained output."""
+    if not isinstance(parsed, dict):
+        return {"action": "unknown"}
+
+    action = parsed.get("action")
+    if action == "list":
+        return {"action": "list"}
+    if action == "add":
+        tickers = parsed.get("tickers")
+        time_str = parsed.get("time")
+        if isinstance(tickers, list) and tickers and all(isinstance(t, str) for t in tickers) and isinstance(time_str, str):
+            return {"action": "add", "tickers": tickers, "time": time_str}
+    if action == "remove":
+        job_id = parsed.get("id")
+        if isinstance(job_id, str) and re.fullmatch(r"[a-fA-F0-9]{8}", job_id):
+            return {"action": "remove", "id": job_id.lower()}
+    if action == "edit":
+        job_id = parsed.get("id")
+        tickers = parsed.get("tickers")
+        if (
+            isinstance(job_id, str)
+            and re.fullmatch(r"[a-fA-F0-9]{8}", job_id)
+            and isinstance(tickers, list)
+            and tickers
+            and all(isinstance(t, str) for t in tickers)
+        ):
+            return {"action": "edit", "id": job_id.lower(), "tickers": tickers}
+    return {"action": "unknown"}
+
+
+async def parse_schedule_intent(instruction: str, model: str) -> dict:
     """Ask the model to translate a natural-language schedule instruction into
     ONE of a fixed set of JSON actions. This is the only interface between the
     model and schedule_manager -- it never gets to run commands directly.
@@ -632,13 +725,14 @@ Instruction: "{instruction}"
 
 JSON:"""
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": model, "prompt": prompt, "stream": False},
+    raw = await asyncio.to_thread(
+        ollama_generate,
+        prompt,
+        model,
         timeout=60,
+        temperature=0,
+        response_format=SCHEDULE_INTENT_SCHEMA,
     )
-    response.raise_for_status()
-    raw = response.json()["response"].strip()
 
     # Models sometimes wrap JSON in markdown fences -- strip those if present
     raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
@@ -648,10 +742,7 @@ JSON:"""
     except json.JSONDecodeError:
         return {"action": "unknown"}
 
-    if not isinstance(parsed, dict) or "action" not in parsed:
-        return {"action": "unknown"}
-
-    return parsed
+    return validate_schedule_intent(parsed)
 
 
 def format_schedule_list(schedules: list) -> str:
@@ -681,14 +772,55 @@ async def resolve_tickers_for_schedule(raw_tickers: list) -> tuple:
     return resolved, notes
 
 
-async def handle_schedule_command(channel, instruction: str):
+def _pending_schedule_key(channel_id: int, user_id: int) -> tuple[int, int]:
+    return channel_id, user_id
+
+
+def _stage_schedule_action(channel_id: int, user_id: int, intent: dict):
+    pending_schedule_actions[_pending_schedule_key(channel_id, user_id)] = {
+        "intent": intent,
+        "expires_at": time.monotonic() + CONFIRMATION_TTL_SECONDS,
+    }
+
+
+async def confirm_schedule_action(channel, user_id: int):
+    key = _pending_schedule_key(channel.id, user_id)
+    pending = pending_schedule_actions.pop(key, None)
+    if not pending or pending["expires_at"] < time.monotonic():
+        await channel.send("There is no pending schedule change to confirm, or it has expired.")
+        return
+
+    intent = pending["intent"]
+    action = intent["action"]
+    try:
+        if action == "add":
+            result = sched.add_schedule(intent["tickers"], intent["time"])
+            await channel.send(
+                f"Added schedule `{result['id']}`: {', '.join(result['tickers'])} at {result['time']} daily."
+            )
+        elif action == "remove":
+            job_id = intent["id"]
+            if sched.remove_schedule(job_id):
+                await channel.send(f"Removed schedule `{job_id}`.")
+            else:
+                await channel.send(f"No schedule found with id `{job_id}`.")
+        elif action == "edit":
+            result = sched.edit_tickers(intent["id"], intent["tickers"])
+            await channel.send(
+                f"Updated schedule `{result['id']}`: now {', '.join(result['tickers'])} at {result['time']} daily."
+            )
+    except sched.ScheduleError as exc:
+        await channel.send(f"Couldn't do that: {exc}")
+
+
+async def handle_schedule_command(channel, user_id: int, instruction: str):
     """Parse a natural-language schedule instruction and execute it via the
     narrow, validated functions in schedule_manager.py. Every branch here
     calls one specific allowlisted function -- there is no generic execution path.
     """
     async with channel.typing():
         try:
-            intent = parse_schedule_intent(instruction, MODEL)
+            intent = await parse_schedule_intent(instruction, MODEL)
         except requests.exceptions.ConnectionError:
             await channel.send("Couldn't reach Ollama on this machine. Is it running? (`ollama serve`)")
             return
@@ -705,28 +837,46 @@ async def handle_schedule_command(channel, instruction: str):
 
         elif action == "add":
             resolved_tickers, notes = await resolve_tickers_for_schedule(intent.get("tickers", []))
-            result = sched.add_schedule(resolved_tickers, intent.get("time", ""))
+            time_str = intent.get("time", "")
+            # Validate before staging, but do not persist anything yet.
+            resolved_tickers, _ = sched.validate_schedule_spec(resolved_tickers, time_str)
+            _stage_schedule_action(
+                channel.id,
+                user_id,
+                {"action": "add", "tickers": resolved_tickers, "time": time_str},
+            )
             note_text = ("\n" + "\n".join(notes)) if notes else ""
             await channel.send(
-                f"Added schedule `{result['id']}`: {', '.join(result['tickers'])} at {result['time']} daily."
-                f"{note_text}"
+                f"Create a daily schedule for {', '.join(resolved_tickers)} at {time_str}?{note_text}\n"
+                f"Reply `!confirm` within {CONFIRMATION_TTL_SECONDS} seconds, or `!cancel`."
             )
 
         elif action == "remove":
             job_id = intent.get("id", "")
-            removed = sched.remove_schedule(job_id)
-            if removed:
-                await channel.send(f"Removed schedule `{job_id}`.")
-            else:
+            if not any(s["id"] == job_id for s in sched.list_schedules()):
                 await channel.send(f"No schedule found with id `{job_id}`. Try `!schedule list` to see valid ids.")
+            else:
+                _stage_schedule_action(channel.id, user_id, {"action": "remove", "id": job_id})
+                await channel.send(
+                    f"Remove schedule `{job_id}`? Reply `!confirm` within "
+                    f"{CONFIRMATION_TTL_SECONDS} seconds, or `!cancel`."
+                )
 
         elif action == "edit":
             resolved_tickers, notes = await resolve_tickers_for_schedule(intent.get("tickers", []))
-            result = sched.edit_tickers(intent.get("id", ""), resolved_tickers)
+            job_id = intent.get("id", "")
+            resolved_tickers, _ = sched.validate_schedule_spec(resolved_tickers)
+            if not any(s["id"] == job_id for s in sched.list_schedules()):
+                raise sched.ScheduleError(f"No schedule found with id '{job_id}'.")
+            _stage_schedule_action(
+                channel.id,
+                user_id,
+                {"action": "edit", "id": job_id, "tickers": resolved_tickers},
+            )
             note_text = ("\n" + "\n".join(notes)) if notes else ""
             await channel.send(
-                f"Updated schedule `{result['id']}`: now {', '.join(result['tickers'])} at {result['time']} daily."
-                f"{note_text}"
+                f"Change schedule `{job_id}` to {', '.join(resolved_tickers)}?{note_text}\n"
+                f"Reply `!confirm` within {CONFIRMATION_TTL_SECONDS} seconds, or `!cancel`."
             )
 
         else:
@@ -774,6 +924,8 @@ async def run_scheduled_digest(tickers: list):
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}. Listening for messages...")
+    if not ALLOWED_USER_IDS and not ALLOWED_CHANNEL_IDS:
+        print("WARNING: no Discord allowlist configured; all visible users/channels are accepted.")
     sched.init_scheduler(run_scheduled_digest)
     print("Schedule manager initialized; restored any saved schedules.")
 
@@ -788,11 +940,27 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    if ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
+        return
+    if ALLOWED_CHANNEL_IDS and message.channel.id not in ALLOWED_CHANNEL_IDS:
+        return
+
     user_text = message.content.strip()
     if not user_text:
         return
 
     lower_text = user_text.lower()
+
+    if lower_text == "!confirm":
+        await confirm_schedule_action(message.channel, message.author.id)
+        return
+
+    if lower_text == "!cancel":
+        pending_schedule_actions.pop(
+            _pending_schedule_key(message.channel.id, message.author.id), None
+        )
+        await message.channel.send("Pending schedule change cancelled.")
+        return
 
     if "how are you" in lower_text:
         await message.channel.send("I’m doing well, thanks — how are you?")
@@ -861,7 +1029,7 @@ async def on_message(message: discord.Message):
 
     if user_text.lower().startswith("!schedule"):
         instruction = user_text[len("!schedule"):].strip()
-        await handle_schedule_command(message.channel, instruction)
+        await handle_schedule_command(message.channel, message.author.id, instruction)
         return
 
     if user_text.lower().startswith("!code"):
@@ -878,7 +1046,7 @@ async def on_message(message: discord.Message):
 
         async with message.channel.typing():
             try:
-                matches = code_search.search_codebase(question)
+                matches = await asyncio.to_thread(code_search.search_codebase, question)
                 context = code_search.format_snippets_for_prompt(matches)
                 prompt = f"""You are answering a question about your own source code, using ONLY
 the code snippets below as ground truth. Explain the actual behavior in a
@@ -890,13 +1058,13 @@ bullet points. Mention the relevant file(s) by name.
 Question: {question}
 
 Answer:"""
-                response = requests.post(
-                    OLLAMA_URL,
-                    json={"model": MODEL, "prompt": prompt, "stream": False},
+                answer = await asyncio.to_thread(
+                    ollama_generate,
+                    prompt,
+                    MODEL,
                     timeout=120,
+                    temperature=0.2,
                 )
-                response.raise_for_status()
-                answer = response.json()["response"].strip()
             except requests.exceptions.ConnectionError:
                 await message.channel.send("Couldn't reach Ollama on this machine. Is it running?")
                 return
@@ -918,8 +1086,7 @@ Answer:"""
 
     async with message.channel.typing():
         try:
-            reply = ask_mistral(message.channel.id, user_text)
-            remember_fact_if_any(user_text, MODEL)  # check if this message is worth remembering long-term
+            reply = await ask_mistral(message.channel.id, user_text)
         except requests.exceptions.ConnectionError:
             await message.channel.send(
                 "Couldn't reach Ollama on this machine. Is it running? (`ollama serve`)"
@@ -931,6 +1098,9 @@ Answer:"""
 
     for chunk in split_for_discord(reply):
         await message.channel.send(chunk)
+
+    # Memory extraction is useful, but it should never delay the visible reply.
+    asyncio.create_task(remember_fact_if_any(user_text, MODEL))
 
 
 if __name__ == "__main__":
