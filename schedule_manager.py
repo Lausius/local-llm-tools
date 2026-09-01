@@ -82,6 +82,13 @@ def _validate_time(time_str: str):
     return int(hour), int(minute)
 
 
+def validate_schedule_spec(tickers: list, time_str: str | None = None) -> tuple[list, tuple[int, int] | None]:
+    """Validate a proposed schedule without changing persisted jobs."""
+    cleaned = _validate_tickers(tickers)
+    parsed_time = _validate_time(time_str) if time_str is not None else None
+    return cleaned, parsed_time
+
+
 async def _fire_job(job_id: str):
     """Called by APScheduler when a job's time arrives. Looks up the job's
     current tickers from disk (in case they were edited) and runs the digest.
