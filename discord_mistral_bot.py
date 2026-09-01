@@ -333,6 +333,26 @@ def format_schedule_list(schedules: list) -> str:
     return "Current schedules:\n" + "\n".join(lines)
 
 
+async def resolve_tickers_for_schedule(raw_tickers: list) -> tuple:
+    """Resolve a list of user-provided tickers/company names into real,
+    working Alpha Vantage symbols, using stock_digest.resolve_ticker for
+    each. Runs in an executor since it makes blocking network calls.
+    Returns (resolved_symbols, notes) where notes describes any name ->
+    symbol resolutions that happened, for user-facing confirmation.
+    """
+    loop = asyncio.get_running_loop()
+    resolved = []
+    notes = []
+
+    for raw in raw_tickers:
+        symbol, _data, note = await loop.run_in_executor(None, stock_digest.resolve_ticker, raw, MODEL)
+        resolved.append(symbol)
+        if note:
+            notes.append(f"Resolved {note}")
+
+    return resolved, notes
+
+
 async def handle_schedule_command(channel, instruction: str):
     """Parse a natural-language schedule instruction and execute it via the
     narrow, validated functions in schedule_manager.py. Every branch here
@@ -356,9 +376,12 @@ async def handle_schedule_command(channel, instruction: str):
             await channel.send(format_schedule_list(schedules))
 
         elif action == "add":
-            result = sched.add_schedule(intent.get("tickers", []), intent.get("time", ""))
+            resolved_tickers, notes = await resolve_tickers_for_schedule(intent.get("tickers", []))
+            result = sched.add_schedule(resolved_tickers, intent.get("time", ""))
+            note_text = ("\n" + "\n".join(notes)) if notes else ""
             await channel.send(
                 f"Added schedule `{result['id']}`: {', '.join(result['tickers'])} at {result['time']} daily."
+                f"{note_text}"
             )
 
         elif action == "remove":
@@ -370,16 +393,19 @@ async def handle_schedule_command(channel, instruction: str):
                 await channel.send(f"No schedule found with id `{job_id}`. Try `!schedule list` to see valid ids.")
 
         elif action == "edit":
-            result = sched.edit_tickers(intent.get("id", ""), intent.get("tickers", []))
+            resolved_tickers, notes = await resolve_tickers_for_schedule(intent.get("tickers", []))
+            result = sched.edit_tickers(intent.get("id", ""), resolved_tickers)
+            note_text = ("\n" + "\n".join(notes)) if notes else ""
             await channel.send(
                 f"Updated schedule `{result['id']}`: now {', '.join(result['tickers'])} at {result['time']} daily."
+                f"{note_text}"
             )
 
         else:
             await channel.send(
                 "I couldn't understand that as a schedule instruction. Try things like:\n"
                 "`!schedule list`\n"
-                "`!schedule add AAPL ORSTED.CO at 08:00`\n"
+                "`!schedule add ORSTED at 08:00` (company names work too)\n"
                 "`!schedule remove abc12345`\n"
                 "`!schedule edit abc12345 to TSLA MSFT`"
             )
@@ -398,11 +424,23 @@ client = discord.Client(intents=intents)
 
 async def run_scheduled_digest(tickers: list):
     """Wraps the (blocking) stock_digest.run_digest so it can be awaited by
-    the scheduler without blocking the bot's event loop.
+    the scheduler without blocking the bot's event loop. Posts a failure
+    notice to Discord (via the same webhook) if the digest fails, so
+    problems are visible instead of only showing up in container logs.
     """
     loop = asyncio.get_running_loop()
-    status = await loop.run_in_executor(None, stock_digest.run_digest, tickers, MODEL)
-    print(f"[scheduled digest] {status}")
+    try:
+        status = await loop.run_in_executor(None, stock_digest.run_digest, tickers, MODEL)
+        print(f"[scheduled digest] {status}")
+    except Exception as e:
+        error_msg = f"⚠️ Scheduled digest for {', '.join(tickers)} failed: {e}"
+        print(f"[scheduled digest] {error_msg}")
+        try:
+            await loop.run_in_executor(
+                None, stock_digest.post_to_discord, stock_digest.WEBHOOK_URL, error_msg
+            )
+        except Exception:
+            pass  # if even posting the error fails, at least it's in the logs above
 
 
 @client.event
